@@ -109,15 +109,74 @@ netfilter-persistent save
 log_result "Iptables 开放全端口" $?
 
 # ================= 7. 开启 BBR 加速 =================
-echo -e "${YELLOW}7. 开启 BBR 加速...${NC}"
-if grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
-     echo -e "${GREEN}BBR 已开启，无需重复设置。${NC}"
-     SUCCESS_TASKS+=("开启 BBR 加速 (已存在)")
+echo -e "${YELLOW}7. 检测并尝试开启 BBR 加速...${NC}"
+
+BBR_SKIPPED_REASON=""
+BBR_ENABLED=0
+
+# 0) 检测虚拟化类型（KVM 通常可控内核；LXC/OpenVZ 常见不可控内核）
+VIRT_TYPE="$(systemd-detect-virt 2>/dev/null || echo unknown)"
+
+case "$VIRT_TYPE" in
+  lxc|openvz|container)
+    BBR_SKIPPED_REASON="当前虚拟化环境为 $VIRT_TYPE（通常为容器共享宿主内核），可能无法启用 BBR"
+    ;;
+  *)
+    ;;
+esac
+
+# 1) 如未提前判定为容器限制，则尝试加载 tcp_bbr 模块（若内建则无需模块）
+if [ -z "$BBR_SKIPPED_REASON" ]; then
+    if modprobe tcp_bbr 2>/dev/null; then
+        :
+    else
+        # modprobe 失败不一定代表不能用（可能内建 y），继续用 available 列表判定
+        :
+    fi
+
+    # 2) 判断内核是否提供 bbr（关键判定）
+    AVAILABLE_CC="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+    if echo "$AVAILABLE_CC" | grep -qw bbr; then
+        # 3) 写入持久化配置（使用 sysctl.d，避免重复追加 /etc/sysctl.conf）
+        cat >/etc/sysctl.d/99-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+        # 4) 持久化模块加载（若内建也无害）
+        cat >/etc/modules-load.d/bbr.conf <<'EOF'
+tcp_bbr
+EOF
+
+        # 5) 应用（用 --system 更贴近开机加载顺序）
+        sysctl --system >/dev/null 2>&1
+
+        # 6) 立即再强制写一次，避免被其它文件覆盖（以当前执行时为准）
+        sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1
+        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
+
+        # 7) 验证
+        CUR_CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+        CUR_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+
+        if [ "$CUR_CC" = "bbr" ]; then
+            echo -e "${GREEN}已启用 BBR：tcp_congestion_control=${CUR_CC}；default_qdisc=${CUR_QDISC}${NC}"
+            BBR_ENABLED=1
+        else
+            BBR_SKIPPED_REASON="检测到 bbr 可用（available: ${AVAILABLE_CC}），但设置后仍未生效（当前: ${CUR_CC}）。可能被其他 sysctl 配置覆盖或内核策略限制。"
+        fi
+    else
+        BBR_SKIPPED_REASON="当前内核未提供 bbr（available: ${AVAILABLE_CC}）。无法启用 BBR"
+    fi
+fi
+
+# 8) 记录结果：成功/跳过但继续
+if [ "$BBR_ENABLED" -eq 1 ]; then
+    log_result "开启 BBR 加速" 0
 else
-    echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-    sysctl -p
-    log_result "开启 BBR 加速" $?
+    echo -e "${YELLOW}跳过启用 BBR：${BBR_SKIPPED_REASON}${NC}"
+    SUCCESS_TASKS+=("开启 BBR 加速 (已跳过：${BBR_SKIPPED_REASON})")
+    echo "----------------------------------------------------"
 fi
 
 # ================= 8. 设置时区 =================
